@@ -1,0 +1,35 @@
+seed: 42
+
+env:
+  name: Pendulum-v1
+
+train:
+  total_steps: 50000
+  seed_steps: 1000
+  batch_size: 32
+  seq_len: 32
+  train_every: 50
+  train_updates: 50
+  eval_every: 2000
+
+model:
+  obs_dim: null
+  action_dim: null
+  deter_dim: 128
+  stoch_dim: 32
+  hidden_dim: 128
+
+optim:
+  world_model_lr: 3e-4
+  actor_lr: 3e-4
+  critic_lr: 3e-4
+
+buffer:
+  capacity: 100000
+
+rl:
+  gamma: 0.99
+  lambda_: 0.95
+  imagine_horizon: 15
+
+device: cuda
