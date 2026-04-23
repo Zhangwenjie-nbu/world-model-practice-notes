@@ -5,39 +5,36 @@ from utils.seed import set_seed
 from envs.make_env import EnvWrapper
 from training.collector import Collector, RandomPolicy
 from data.replay_buffer import ReplayBuffer
+from models.rssm import RSSM
+from models.heads import ObsHead, RewardHead
+from models.actor import Actor
+from models.value import Value
+from training.trainer import DreamerTrainer
+from training.losses import kl_loss_final
+from training.eval import evaluate_actor
+from utils.logger import CSVLogger
+from utils.checkpoint import save_checkpoint
 
 
 def load_config(path: str):
-    """
-    读取 YAML 配置文件。
-    """
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def main():
-    # 1. 读取配置并设置随机种子
+    logger = CSVLogger("logs/train_metrics.csv")
     cfg = load_config("configs/pendulum.yaml")
     set_seed(cfg["seed"])
 
-    # 2. 选择运行设备
     device = torch.device(
         "cuda" if cfg["device"] == "cuda" and torch.cuda.is_available() else "cpu"
     )
 
-    # 3. 创建环境
     env = EnvWrapper(cfg["env"]["name"])
-
-    # 4. 把环境维度写回配置
     cfg["model"]["obs_dim"] = env.obs_dim
     cfg["model"]["action_dim"] = env.action_dim
 
-    print("Env:", cfg["env"]["name"])
-    print("Obs dim:", env.obs_dim)
-    print("Action dim:", env.action_dim)
-    print("Device:", device)
-
-    # 5. 创建随机策略、采集器、replay buffer
+    # 采集器与 buffer
     policy = RandomPolicy(env)
     collector = Collector(env)
     replay_buffer = ReplayBuffer(
@@ -46,37 +43,121 @@ def main():
         device=device,
     )
 
-    # 6. 先采集若干条 episode 放入 buffer
-    num_collect_episodes = 5
-    for i in range(num_collect_episodes):
-        episode = collector.collect_episode(policy, max_steps=300)
-        replay_buffer.add_episode(episode)
-        print(f"\nCollected episode {i+1}")
-        print("Episode length:", len(episode))
-        print("Buffer episodes:", replay_buffer.num_episodes())
-        print("Buffer steps:", len(replay_buffer))
+    # 模型
+    deter_dim = cfg["model"]["deter_dim"]
+    stoch_dim = cfg["model"]["stoch_dim"]
+    hidden_dim = cfg["model"]["hidden_dim"]
+    obs_dim = cfg["model"]["obs_dim"]
+    action_dim = cfg["model"]["action_dim"]
+    feat_dim = deter_dim + stoch_dim
 
-    # 7. 判断是否可以采样
-    batch_size = 4
-    print("\nCan sample:", replay_buffer.can_sample(batch_size))
+    rssm = RSSM(
+        deter_dim=deter_dim,
+        stoch_dim=stoch_dim,
+        action_dim=action_dim,
+        hidden_dim=hidden_dim,
+        obs_dim=obs_dim,
+        device=device,
+    ).to(device)
 
-    if replay_buffer.can_sample(batch_size):
-        batch = replay_buffer.sample_batch(batch_size)
+    obs_head = ObsHead(feat_dim, obs_dim, hidden_dim).to(device)
+    reward_head = RewardHead(feat_dim, hidden_dim).to(device)
+    actor = Actor(feat_dim, action_dim, hidden_dim).to(device)
+    value_net = Value(feat_dim, hidden_dim).to(device)
 
-        print("\nSampled batch:")
-        print("obs shape:     ", tuple(batch["obs"].shape))
-        print("actions shape: ", tuple(batch["actions"].shape))
-        print("rewards shape: ", tuple(batch["rewards"].shape))
-        print("dones shape:   ", tuple(batch["dones"].shape))
-        print("next_obs shape:", tuple(batch["next_obs"].shape))
+    # optimizer
+    wm_optimizer = torch.optim.Adam(
+        list(rssm.parameters()) + list(obs_head.parameters()) + list(reward_head.parameters()),
+        lr=float(cfg["optim"]["world_model_lr"]),
+    )
+    actor_optimizer = torch.optim.Adam(
+        actor.parameters(),
+        lr=float(cfg["optim"]["actor_lr"]),
+    )
+    value_optimizer = torch.optim.Adam(
+        value_net.parameters(),
+        lr=float(cfg["optim"]["critic_lr"]),
+    )
 
-        # 8. 打印一个样本序列中的第 0 个时间步，帮助确认数据形式
-        print("\nExample from batch[0, 0]:")
-        print("obs[0,0]      =", batch["obs"][0, 0])
-        print("action[0,0]   =", batch["actions"][0, 0])
-        print("reward[0,0]   =", batch["rewards"][0, 0])
-        print("done[0,0]     =", batch["dones"][0, 0])
-        print("next_obs[0,0] =", batch["next_obs"][0, 0])
+    trainer = DreamerTrainer(
+        rssm=rssm,
+        obs_head=obs_head,
+        reward_head=reward_head,
+        actor=actor,
+        value_net=value_net,
+        replay_buffer=replay_buffer,
+        wm_optimizer=wm_optimizer,
+        actor_optimizer=actor_optimizer,
+        value_optimizer=value_optimizer,
+        kl_loss_fn=kl_loss_final,
+        imagine_horizon=cfg["rl"]["imagine_horizon"],
+        gamma=cfg["rl"]["gamma"],
+        lambda_=cfg["rl"]["lambda_"],
+    )
+
+    # 先 warmup 一些 episode
+    for _ in range(10):
+        ep = collector.collect_episode(policy, max_steps=300)
+        replay_buffer.add_episode(ep)
+
+    # 主循环
+    total_steps = cfg["train"]["total_steps"]
+    batch_size = cfg["train"]["batch_size"]
+
+    for step in range(total_steps):
+        # 继续收集真实数据
+        ep = collector.collect_episode(policy, max_steps=300)
+        replay_buffer.add_episode(ep)
+
+        if replay_buffer.can_sample(batch_size):
+            metrics = trainer.train_step(batch_size)
+
+            if step % 10 == 0:
+                print(
+                    f"[{step:05d}] "
+                    f"wm={metrics['wm_loss']:.4f} "
+                    f"obs={metrics['obs_loss']:.4f} "
+                    f"rew={metrics['reward_loss']:.4f} "
+                    f"kl={metrics['kl_loss']:.4f} "
+                    f"v={metrics['value_loss']:.4f} "
+                    f"a={metrics['actor_loss']:.4f}"
+                )
+
+
+            if step % 50 == 0:
+                avg_return = evaluate_actor(
+                    env=env,
+                    rssm=rssm,
+                    actor=actor,
+                    num_episodes=3,
+                    max_steps=300,
+                    device=device,
+                )
+                print(f"[Eval {step:05d}] avg_return={avg_return:.2f}")
+                metrics_to_log["eval_return"] = avg_return
+
+
+            metrics_to_log = {
+                "step": step,
+                **metrics,
+            }
+            logger.log(metrics_to_log)
+
+            if step % 100 == 0:
+                save_checkpoint(
+                    path=f"checkpoints/step_{step:05d}.pt",
+                    rssm=rssm,
+                    obs_head=obs_head,
+                    reward_head=reward_head,
+                    actor=actor,
+                    value_net=value_net,
+                    wm_optimizer=wm_optimizer,
+                    actor_optimizer=actor_optimizer,
+                    value_optimizer=value_optimizer,
+                    step=step,
+                )
+
+
 
 
 if __name__ == "__main__":

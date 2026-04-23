@@ -1,0 +1,49 @@
+seed: 42
+device: "cuda"
+
+dataset:
+  train_path: "data/moving_mnist/train.npy"
+  test_path: "data/moving_mnist/test.npy"
+  image_size: 64
+  seq_len: 20
+  context_len: 10
+  pred_len: 10
+  num_workers: 2
+
+model:
+  image_channels: 1
+  image_size: 64
+  embedding_dim: 128
+  deter_dim: 128
+  stoch_dim: 32
+  feature_dim: 160
+  hidden_dim: 256
+  min_std: 0.1
+
+loss:
+  recon_loss_type: "bce"  # "mse" or "bce"
+  kl_weight: 0.01
+  free_nats: 0.0
+  future_loss_weight: 1.0
+
+train:
+  batch_size: 16
+  shuffle: true
+  drop_last: true
+  learning_rate: 0.001
+  num_epochs: 10
+  grad_clip_norm: 100.0
+  log_interval: 50
+
+eval:
+  batch_size: 16
+  shuffle: false
+  drop_last: false
+  num_visualize_samples: 4
+
+checkpoint:
+  save_dir: "outputs/checkpoints"
+  save_every: 1
+
+output:
+  vis_dir: "outputs/vis"
