@@ -1,0 +1,364 @@
+# scripts/test_critic.py
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+# 让脚本可以从项目根目录导入模块
+ROOT_DIR = Path(__file__).resolve().parents[1]
+sys.path.append(str(ROOT_DIR))
+
+from envs.grid_nav_env import GridNavEnv
+from models.encoder import VisualEncoder
+from models.rssm import RSSM
+from models.actor import DiscreteActor
+from models.critic import Critic
+from models.common import count_parameters
+
+
+def obs_sequence_to_tensor(obs_sequence: np.ndarray, device: torch.device) -> torch.Tensor:
+    """
+    将环境图像序列转换为 PyTorch Tensor。
+
+    输入：
+        obs_sequence:
+            形状为 (T, H, W, C)，dtype=uint8，range=[0,255]
+
+    输出：
+        obs_tensor:
+            形状为 (1, T, C, H, W)，dtype=float32，range=[0,1]
+    """
+    assert obs_sequence.ndim == 4
+    assert obs_sequence.shape[-1] == 3
+    assert obs_sequence.dtype == np.uint8
+
+    tensor = torch.from_numpy(obs_sequence).float() / 255.0
+
+    # T,H,W,C -> T,C,H,W
+    tensor = tensor.permute(0, 3, 1, 2)
+
+    # T,C,H,W -> B,T,C,H,W
+    tensor = tensor.unsqueeze(0)
+
+    return tensor.to(device)
+
+
+def encode_sequence(
+    encoder: VisualEncoder,
+    obs_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """
+    对图像序列逐帧编码。
+
+    输入：
+        obs_tensor:
+            形状为 (B, T, C, H, W)
+
+    输出：
+        embeddings:
+            形状为 (B, T, embedding_dim)
+    """
+    batch_size, seq_len, channels, height, width = obs_tensor.shape
+
+    flat_obs = obs_tensor.reshape(batch_size * seq_len, channels, height, width)
+    flat_embeddings = encoder(flat_obs)
+
+    embeddings = flat_embeddings.reshape(batch_size, seq_len, -1)
+
+    return embeddings
+
+
+def collect_sequence_with_rewards(env: GridNavEnv, seq_len: int = 12):
+    """
+    从环境中采集一段序列，同时保存 previous action、reward、done 和 valid mask。
+
+    时间步对齐：
+        obs_0 来自 reset：
+            prev_actions[0] = ACTION_STAY
+            rewards[0] = 0.0
+
+        obs_t 对应：
+            prev_actions[t] = 进入 obs_t 前执行的动作
+            rewards[t] = 执行该动作后获得的 reward
+
+    valid_mask:
+        True 表示该时间步是真实环境采样得到的；
+        False 表示提前 done 后为了补齐长度复制出来的 padding。
+    """
+
+    obs_list = []
+    prev_action_list = []
+    reward_list = []
+    done_list = []
+    valid_list = []
+
+    obs = env.reset()
+
+    obs_list.append(obs)
+    prev_action_list.append(GridNavEnv.ACTION_STAY)
+    reward_list.append(0.0)
+    done_list.append(False)
+    valid_list.append(True)
+
+    all_actions = [
+        GridNavEnv.ACTION_FORWARD,
+        GridNavEnv.ACTION_TURN_LEFT,
+        GridNavEnv.ACTION_TURN_RIGHT,
+        GridNavEnv.ACTION_STAY,
+    ]
+
+    for _ in range(seq_len - 1):
+        action = int(np.random.choice(all_actions))
+
+        obs, reward, done, info = env.step(action)
+
+        obs_list.append(obs)
+        prev_action_list.append(action)
+        reward_list.append(float(reward))
+        done_list.append(bool(done))
+        valid_list.append(True)
+
+        if done:
+            break
+
+    # 提前结束时补齐序列。
+    # 正式训练时 replay buffer 会按 episode 管理，这里只是测试维度。
+    while len(obs_list) < seq_len:
+        obs_list.append(obs_list[-1])
+        prev_action_list.append(GridNavEnv.ACTION_STAY)
+        reward_list.append(0.0)
+        done_list.append(True)
+        valid_list.append(False)
+
+    obs_sequence = np.stack(obs_list, axis=0)
+    prev_actions = np.array(prev_action_list, dtype=np.int64)
+    rewards = np.array(reward_list, dtype=np.float32)
+    dones = np.array(done_list, dtype=np.bool_)
+    valid_mask = np.array(valid_list, dtype=np.float32)
+
+    return obs_sequence, prev_actions, rewards, dones, valid_mask
+
+
+def compute_value_targets(
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    gamma: float = 0.99,
+) -> np.ndarray:
+    """
+    根据 reward 序列构造 Monte Carlo value target。
+
+    重要：
+        rewards[t] 表示进入 obs_t 时刚收到的 reward。
+        Critic(feat[t]) 估计从 obs_t 继续行动后的未来回报。
+
+    因此：
+        value_target[t] = rewards[t+1] + gamma * rewards[t+2] + ...
+
+    最后一个时间步没有后续 reward，因此 target 设为 0。
+    """
+
+    assert rewards.ndim == 1
+    assert dones.ndim == 1
+    assert rewards.shape == dones.shape
+
+    seq_len = rewards.shape[0]
+
+    targets = np.zeros(seq_len, dtype=np.float32)
+
+    # targets[T-1] = 0，因为没有后续 reward
+    running_return = 0.0
+
+    for t in reversed(range(seq_len - 1)):
+        next_reward = rewards[t + 1]
+        next_done = dones[t + 1]
+
+        targets[t] = next_reward + gamma * running_return * (1.0 - float(next_done))
+
+        running_return = targets[t]
+
+    return targets
+
+
+def action_name(action: int) -> str:
+    mapping = {
+        GridNavEnv.ACTION_FORWARD: "forward",
+        GridNavEnv.ACTION_TURN_LEFT: "turn_left",
+        GridNavEnv.ACTION_TURN_RIGHT: "turn_right",
+        GridNavEnv.ACTION_STAY: "stay",
+    }
+    return mapping[int(action)]
+
+
+def main():
+    np.random.seed(0)
+    torch.manual_seed(0)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("=" * 60)
+    print(f"当前设备: {device}")
+    print("=" * 60)
+
+    env = GridNavEnv(
+        map_width=10,
+        map_height=10,
+        image_size=64,
+        max_steps=50,
+        random_reset=True,
+        seed=42,
+    )
+
+    seq_len = 12
+    gamma = 0.99
+
+    obs_sequence, prev_actions, rewards, dones, valid_mask = collect_sequence_with_rewards(
+        env=env,
+        seq_len=seq_len,
+    )
+
+    value_targets_np = compute_value_targets(
+        rewards=rewards,
+        dones=dones,
+        gamma=gamma,
+    )
+
+    print("[采集到的环境序列]")
+    print(f"obs_sequence shape: {obs_sequence.shape}")
+    print(f"prev_actions shape: {prev_actions.shape}")
+    print(f"rewards shape: {rewards.shape}")
+    print(f"dones shape: {dones.shape}")
+    print(f"valid_mask shape: {valid_mask.shape}")
+    print(f"prev_actions: {prev_actions.tolist()}")
+    print(f"rewards: {[round(float(r), 3) for r in rewards.tolist()]}")
+    print(f"dones: {dones.tolist()}")
+    print(f"valid_mask: {valid_mask.tolist()}")
+    print(f"value_targets: {[round(float(v), 3) for v in value_targets_np.tolist()]}")
+
+    obs_tensor = obs_sequence_to_tensor(obs_sequence, device)
+    actions_tensor = torch.from_numpy(prev_actions).long().unsqueeze(0).to(device)
+
+    value_targets = torch.from_numpy(value_targets_np).float().view(1, seq_len, 1).to(device)
+    valid_mask_tensor = torch.from_numpy(valid_mask).float().view(1, seq_len, 1).to(device)
+
+    print("\n[转换为模型输入]")
+    print(f"obs_tensor shape:        {obs_tensor.shape}")
+    print(f"actions_tensor shape:    {actions_tensor.shape}")
+    print(f"value_targets shape:     {value_targets.shape}")
+    print(f"valid_mask_tensor shape: {valid_mask_tensor.shape}")
+
+    encoder = VisualEncoder(
+        image_size=64,
+        in_channels=3,
+        embedding_dim=256,
+    ).to(device)
+
+    rssm = RSSM(
+        embedding_dim=256,
+        num_actions=4,
+        action_embed_dim=32,
+        deter_dim=256,
+        stoch_dim=32,
+        hidden_dim=256,
+        min_std=0.1,
+    ).to(device)
+
+    actor = DiscreteActor(
+        feature_dim=288,
+        hidden_dim=256,
+        num_actions=4,
+    ).to(device)
+
+    critic = Critic(
+        feature_dim=288,
+        hidden_dim=256,
+    ).to(device)
+
+    encoder.eval()
+    rssm.eval()
+    actor.eval()
+    critic.eval()
+
+    print("\n[模型参数量]")
+    print(f"Encoder 参数量:  {count_parameters(encoder):,}")
+    print(f"RSSM 参数量:     {count_parameters(rssm):,}")
+    print(f"Actor 参数量:    {count_parameters(actor):,}")
+    print(f"Critic 参数量:   {count_parameters(critic):,}")
+
+    with torch.no_grad():
+        embeddings = encode_sequence(encoder, obs_tensor)
+
+        posteriors, priors = rssm.observe(
+            embeddings=embeddings,
+            actions=actions_tensor,
+        )
+
+        posterior_feat = rssm.get_feat(posteriors)
+
+        # Critic 输出 value
+        values = critic(posterior_feat)
+
+        # Actor 输出动作分布，验证 Actor + Critic 可以使用同一个 feature
+        action_dist = actor(posterior_feat)
+        sampled_actions = action_dist.sample()
+        entropy = action_dist.entropy()
+
+        # masked value loss
+        squared_error = (values - value_targets) ** 2
+        value_loss = (squared_error * valid_mask_tensor).sum() / valid_mask_tensor.sum().clamp_min(1.0)
+
+    print("\n[中间特征]")
+    print(f"embeddings shape:        {embeddings.shape}")
+    print(f"posterior_feat shape:    {posterior_feat.shape}")
+
+    print("\n[Critic 输出]")
+    print(f"values shape:            {values.shape}")
+    print(f"value_targets shape:     {value_targets.shape}")
+    print(f"value_loss:              {value_loss.item():.6f}")
+
+    print("\n[Actor 同步检查]")
+    print(f"action probs shape:      {action_dist.probs.shape}")
+    print(f"sampled_actions shape:   {sampled_actions.shape}")
+    print(f"entropy shape:           {entropy.shape}")
+
+    print("\n[Value 估计示例]")
+    values_np = values.squeeze(0).squeeze(-1).cpu().numpy()
+    targets_np = value_targets.squeeze(0).squeeze(-1).cpu().numpy()
+    sampled_np = sampled_actions.squeeze(0).cpu().numpy()
+
+    for t in range(seq_len):
+        print(
+            f"t={t:02d}, "
+            f"target={targets_np[t]: .4f}, "
+            f"value={values_np[t]: .4f}, "
+            f"sampled_action={sampled_np[t]}({action_name(sampled_np[t])}), "
+            f"valid={bool(valid_mask[t])}"
+        )
+
+    # 单步 value 测试
+    last_feat = posterior_feat[:, -1]
+
+    with torch.no_grad():
+        last_value = critic(last_feat)
+
+    print("\n[单步 Critic 测试]")
+    print(f"last_feat shape:         {last_feat.shape}")
+    print(f"last_value shape:        {last_value.shape}")
+    print(f"last_value:              {last_value.item():.6f}")
+
+    assert embeddings.shape == (1, seq_len, 256)
+    assert posterior_feat.shape == (1, seq_len, 288)
+    assert values.shape == (1, seq_len, 1)
+    assert value_targets.shape == (1, seq_len, 1)
+    assert action_dist.probs.shape == (1, seq_len, env.num_actions)
+    assert sampled_actions.shape == (1, seq_len)
+    assert entropy.shape == (1, seq_len)
+    assert last_value.shape == (1, 1)
+
+    print("\n测试通过：Encoder + RSSM + Actor + Critic 可以正常串联，并且可以计算 value loss。")
+
+
+if __name__ == "__main__":
+    main()
